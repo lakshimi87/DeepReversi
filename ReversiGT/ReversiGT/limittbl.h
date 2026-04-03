@@ -1,4 +1,5 @@
-int limit[64][8] =
+// Max steps in each direction (N, NE, E, SE, S, SW, W, NW) per board position
+static int limit[64][8] =
 {
 	{ 0, 0, 7, 7, 7, 0, 0, 0 },
 	{ 0, 0, 6, 6, 7, 1, 1, 0 },
