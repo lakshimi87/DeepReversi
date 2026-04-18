@@ -46,6 +46,9 @@ class Config:
 	server_host: str = "127.0.0.1"
 	server_port: int = 8888
 	model_path: str = "reversi_model.pt"
+	# Checkpoints
+	checkpoint_dir: str = "checkpoints"
+	checkpoint_interval: int = 10
 
 
 # --- Constants ---
@@ -86,6 +89,32 @@ def _detect_device():
 	return torch.device("cpu")
 
 DEVICE = _detect_device()
+
+
+# --- Checkpoint I/O ---
+
+def _load_model_weights(net, path):
+	"""Load model weights from `path`, accepting either a raw state_dict
+	file or a full-checkpoint dict with a 'model_state_dict' key."""
+	try:
+		state = torch.load(path, map_location=DEVICE, weights_only=True)
+	except Exception:
+		# Full checkpoint dicts contain mixed Python objects (optimizer
+		# state, replay buffer) which the safe loader rejects. Fall back
+		# to the permissive loader — checkpoint files are written by us.
+		state = torch.load(path, map_location=DEVICE, weights_only=False)
+	if isinstance(state, dict) and "model_state_dict" in state:
+		state = state["model_state_dict"]
+	net.load_state_dict(state)
+
+
+def _resolve_model_path(config):
+	"""Return the model file to load from, preferring a fresh checkpoint
+	under `checkpoint_dir` over the legacy flat `model_path`."""
+	latest = os.path.join(config.checkpoint_dir, "latest.pt")
+	if os.path.exists(latest):
+		return latest
+	return config.model_path
 
 
 # --- Game Engine ---
@@ -589,22 +618,65 @@ class Trainer:
 			weight_decay=config.weight_decay,
 		)
 		self.replay_buffer = collections.deque(maxlen=config.replay_buffer_size)
-		# Load existing model for continued training
-		if os.path.exists(config.model_path):
-			self.net.load_state_dict(
-				torch.load(config.model_path, map_location=DEVICE, weights_only=True)
-			)
-			print(f"Resumed from existing model: {config.model_path}")
+		self.start_iteration = 0
+		self._resume()
+
+	def _resume(self):
+		"""Resume from checkpoints/latest.pt if available (full state),
+		otherwise seed weights from the legacy flat model file."""
+		latest = os.path.join(self.config.checkpoint_dir, "latest.pt")
+		if os.path.exists(latest):
+			ckpt = torch.load(latest, map_location=DEVICE, weights_only=False)
+			if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+				self.net.load_state_dict(ckpt["model_state_dict"])
+				opt_state = ckpt.get("optimizer_state_dict")
+				if opt_state is not None:
+					self.optimizer.load_state_dict(opt_state)
+				buf = ckpt.get("replay_buffer") or []
+				if buf:
+					self.replay_buffer.extend(buf)
+				self.start_iteration = int(ckpt.get("iteration", 0))
+				print(f"Resumed checkpoint {latest} "
+					f"(iteration {self.start_iteration}, "
+					f"buffer {len(self.replay_buffer)})")
+				return
+			# Raw state_dict saved as latest.pt — treat as weights-only seed
+			self.net.load_state_dict(ckpt)
+			print(f"Seeded weights from {latest}")
+			return
+		if os.path.exists(self.config.model_path):
+			_load_model_weights(self.net, self.config.model_path)
+			print(f"Seeded weights from {self.config.model_path}")
+
+	def _save_checkpoint(self, iteration):
+		"""Write iter_XXXX.pt and latest.pt with full training state."""
+		os.makedirs(self.config.checkpoint_dir, exist_ok=True)
+		checkpoint = {
+			"iteration": iteration,
+			"model_state_dict": self.net.state_dict(),
+			"optimizer_state_dict": self.optimizer.state_dict(),
+			"replay_buffer": list(self.replay_buffer),
+		}
+		iter_path = os.path.join(
+			self.config.checkpoint_dir, f"iter_{iteration:04d}.pt"
+		)
+		latest_path = os.path.join(self.config.checkpoint_dir, "latest.pt")
+		torch.save(checkpoint, iter_path)
+		torch.save(checkpoint, latest_path)
+		print(f"  Checkpoint saved: {iter_path} (latest.pt updated)")
 
 	def train(self):
 		"""Main training loop."""
 		print(f"Training on device: {DEVICE}")
-		print(f"Config: {self.config.num_iterations} iterations, "
+		start = self.start_iteration + 1
+		end = self.start_iteration + self.config.num_iterations
+		print(f"Config: iterations {start}..{end}, "
 			f"{self.config.num_episodes} episodes/iter, "
-			f"{self.config.num_simulations} MCTS sims")
+			f"{self.config.num_simulations} MCTS sims, "
+			f"checkpoint every {self.config.checkpoint_interval} iters")
 
-		for iteration in range(1, self.config.num_iterations + 1):
-			print(f"\n=== Iteration {iteration}/{self.config.num_iterations} ===")
+		for iteration in range(start, end + 1):
+			print(f"\n=== Iteration {iteration} ===")
 
 			# Self-play
 			self.net.eval()
@@ -628,9 +700,10 @@ class Trainer:
 			avg_v = total_v_loss / max(num_batches, 1)
 			print(f"  Loss: policy={avg_p:.4f}, value={avg_v:.4f}")
 
-			# Save checkpoint
-			torch.save(self.net.state_dict(), self.config.model_path)
-			print(f"  Model saved: {self.config.model_path}")
+			# Save checkpoint every N iterations (and on the final iter)
+			if (iteration % self.config.checkpoint_interval == 0
+					or iteration == end):
+				self._save_checkpoint(iteration)
 
 	def _train_epoch(self):
 		"""Train one epoch on replay buffer samples."""
@@ -675,13 +748,12 @@ class GameCenterClient:
 	def __init__(self, config):
 		self.config = config
 		self.net = ReversiNet(config).to(DEVICE)
-		if os.path.exists(config.model_path):
-			self.net.load_state_dict(
-				torch.load(config.model_path, map_location=DEVICE, weights_only=True)
-			)
-			print(f"Model loaded: {config.model_path}")
+		path = _resolve_model_path(config)
+		if os.path.exists(path):
+			_load_model_weights(self.net, path)
+			print(f"Model loaded: {path}")
 		else:
-			print(f"Warning: no model at {config.model_path}, using random weights")
+			print(f"Warning: no model at {path}, using random weights")
 		self.net.eval()
 		self.mcts = MCTS(self.net, config)
 
@@ -881,13 +953,12 @@ def scoreboard_get_move(board):
 def test_games(config, opponent_type, num_games=100, gt_depth=5):
 	"""Play num_games between AI (MCTS) and opponent, report win rate."""
 	net = ReversiNet(config).to(DEVICE)
-	if os.path.exists(config.model_path):
-		net.load_state_dict(
-			torch.load(config.model_path, map_location=DEVICE, weights_only=True)
-		)
-		print(f"Model loaded: {config.model_path}")
+	path = _resolve_model_path(config)
+	if os.path.exists(path):
+		_load_model_weights(net, path)
+		print(f"Model loaded: {path}")
 	else:
-		print(f"Warning: no model at {config.model_path}, using random weights")
+		print(f"Warning: no model at {path}, using random weights")
 	net.eval()
 	mcts = MCTS(net, config)
 
@@ -979,11 +1050,10 @@ def play_human_pygame(config, human_color=2):
 	clock = pygame.time.Clock()
 
 	net = ReversiNet(config).to(DEVICE)
-	if os.path.exists(config.model_path):
-		net.load_state_dict(
-			torch.load(config.model_path, map_location=DEVICE, weights_only=True)
-		)
-		print(f"Model loaded: {config.model_path}")
+	path = _resolve_model_path(config)
+	if os.path.exists(path):
+		_load_model_weights(net, path)
+		print(f"Model loaded: {path}")
 	else:
 		print("Warning: no model found, using random weights")
 	net.eval()

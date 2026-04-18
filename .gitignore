@@ -36,3 +36,7 @@ x64
 *.exe
 *.out
 *.app
+
+# Model weights and checkpoints
+*.pt
+checkpoints/

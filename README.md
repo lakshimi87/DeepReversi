@@ -48,7 +48,7 @@ Creates a Python virtual environment at `~/venvs/torch/` and installs dependenci
 ./train.sh
 ```
 
-Runs 100 iterations of self-play training (50 episodes each). Saves checkpoints to `reversi_model.pt`.
+Runs 100 iterations of self-play training (50 episodes each). Saves a full checkpoint (model + optimizer + replay buffer + iteration) every 10 iterations to `checkpoints/iter_XXXX.pt`, with `checkpoints/latest.pt` tracking the most recent. Training auto-resumes from `checkpoints/latest.pt` if present.
 
 **Play against the AI (interactive GUI):**
 
