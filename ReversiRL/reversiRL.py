@@ -71,12 +71,21 @@ for _p in range(NUM_CELLS):
 			_nc += DC[_d]
 		LIMIT[_p][_d] = _steps
 
-# Auto-detect device
-DEVICE = torch.device(
-	"cuda" if torch.cuda.is_available()
-	else "mps" if torch.backends.mps.is_available()
-	else "cpu"
-)
+# Auto-detect device (verify CUDA actually works before using it)
+def _detect_device():
+	if torch.cuda.is_available():
+		try:
+			# Test that CUDA kernels actually run on this GPU
+			t = torch.zeros(1, device="cuda")
+			_ = t + 1
+			return torch.device("cuda")
+		except RuntimeError:
+			pass
+	if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+		return torch.device("mps")
+	return torch.device("cpu")
+
+DEVICE = _detect_device()
 
 
 # --- Game Engine ---
@@ -478,11 +487,16 @@ class MCTS:
 		return value
 
 	def _backup(self, node, value):
-		"""Propagate value up the tree, alternating perspective."""
+		"""Propagate value up the tree. Each child's q accumulates from the
+		parent's (move-maker's) perspective, so MAX-UCB selects a parent's
+		best move. We flip before adding: the leaf's NN value is from the
+		leaf's own perspective, so negating once before storing at the leaf
+		shifts it to the leaf's parent's perspective, and further flips up
+		the chain alternate correctly."""
 		while node is not None:
+			value = -value
 			node.visit_count += 1
 			node.value_sum += value
-			value = -value
 			node = node.parent
 
 
@@ -575,6 +589,12 @@ class Trainer:
 			weight_decay=config.weight_decay,
 		)
 		self.replay_buffer = collections.deque(maxlen=config.replay_buffer_size)
+		# Load existing model for continued training
+		if os.path.exists(config.model_path):
+			self.net.load_state_dict(
+				torch.load(config.model_path, map_location=DEVICE, weights_only=True)
+			)
+			print(f"Resumed from existing model: {config.model_path}")
 
 	def train(self):
 		"""Main training loop."""
@@ -770,12 +790,345 @@ class GameCenterClient:
 		print(f"\nResults: Wins={wins[1]}, Losses={wins[0]}, Ties={wins[2]}")
 
 
+# --- Game Tree AI (Minimax + Alpha-Beta) ---
+
+SCORE_BOARD = [
+	10,  1,  3,  2,  2,  3,  1, 10,
+	 1, -5, -1, -1, -1, -1, -5,  1,
+	 3, -1,  0,  0,  0,  0, -1,  3,
+	 2, -1,  0,  0,  0,  0, -1,  2,
+	 2, -1,  0,  0,  0,  0, -1,  2,
+	 3, -1,  0,  0,  0,  0, -1,  3,
+	 1, -5, -1, -1, -1, -1, -5,  1,
+	10,  1,  3,  2,  2,  3,  1, 10,
+]
+
+
+def _gt_evaluate(board):
+	"""Evaluate board from white's perspective using positional weights."""
+	score = 0
+	for i in range(NUM_CELLS):
+		if board.white & (1 << i):
+			score += SCORE_BOARD[i]
+		elif board.black & (1 << i):
+			score -= SCORE_BOARD[i]
+	return score
+
+
+def _gt_minimax(board, depth, alpha, beta):
+	"""Minimax with alpha-beta pruning. Returns (score, move)."""
+	valid = board.get_valid_moves()
+	if not valid:
+		w, b = board.get_score()
+		if w > b:
+			return 10000, -1
+		elif b > w:
+			return -10000, -1
+		return 0, -1
+	if depth == 0:
+		return _gt_evaluate(board), -1
+
+	maximizing = (board.turn == 1)
+	best_move = valid[0]
+
+	if maximizing:
+		best = -100000
+		for move in valid:
+			child = board.copy()
+			child.place(move)
+			score, _ = _gt_minimax(child, depth - 1, alpha, beta)
+			if score > best:
+				best = score
+				best_move = move
+			alpha = max(alpha, score)
+			if alpha >= beta:
+				break
+		return best, best_move
+	else:
+		best = 100000
+		for move in valid:
+			child = board.copy()
+			child.place(move)
+			score, _ = _gt_minimax(child, depth - 1, alpha, beta)
+			if score < best:
+				best = score
+				best_move = move
+			beta = min(beta, score)
+			if alpha >= beta:
+				break
+		return best, best_move
+
+
+def gt_get_move(board, depth=5):
+	"""Get best move using game tree search."""
+	valid = board.get_valid_moves()
+	if len(valid) == 1:
+		return valid[0]
+	_, move = _gt_minimax(board, depth, -100000, 100000)
+	return move
+
+
+def scoreboard_get_move(board):
+	"""Pick valid move with highest SCORE_BOARD weight (tie → random)."""
+	valid = board.get_valid_moves()
+	best = max(SCORE_BOARD[m] for m in valid)
+	top = [m for m in valid if SCORE_BOARD[m] == best]
+	return random.choice(top)
+
+
+# --- Test Harness ---
+
+def test_games(config, opponent_type, num_games=100, gt_depth=5):
+	"""Play num_games between AI (MCTS) and opponent, report win rate."""
+	net = ReversiNet(config).to(DEVICE)
+	if os.path.exists(config.model_path):
+		net.load_state_dict(
+			torch.load(config.model_path, map_location=DEVICE, weights_only=True)
+		)
+		print(f"Model loaded: {config.model_path}")
+	else:
+		print(f"Warning: no model at {config.model_path}, using random weights")
+	net.eval()
+	mcts = MCTS(net, config)
+
+	wins = draws = losses = 0
+	print(f"Testing AI vs {opponent_type} ({num_games} games, "
+		f"{config.num_simulations} MCTS sims)")
+	if opponent_type == "gt":
+		print(f"Game tree depth: {gt_depth}")
+	print()
+
+	for g in range(num_games):
+		board = ReversiBoard()
+		ai_color = 1 if g % 2 == 0 else 2
+
+		while True:
+			valid = board.get_valid_moves()
+			if not valid:
+				break
+			if board.turn == ai_color:
+				if len(valid) == 1:
+					move = valid[0]
+				else:
+					policy = mcts.search(board, board.turn)
+					move = int(np.argmax(policy))
+			else:
+				if opponent_type == "random":
+					move = random.choice(valid)
+				elif opponent_type == "scoreboard":
+					move = scoreboard_get_move(board)
+				else:
+					move = gt_get_move(board, gt_depth)
+			if not board.place(move):
+				break
+
+		winner = board.get_winner()
+		if winner == ai_color:
+			wins += 1
+			result = "Win"
+		elif winner == 0:
+			draws += 1
+			result = "Draw"
+		else:
+			losses += 1
+			result = "Loss"
+
+		w, b = board.get_score()
+		ai_label = "W" if ai_color == 1 else "B"
+		print(f"Game {g+1:3d}/{num_games}: {result:4s} "
+			f"(AI={ai_label} W:{w:2d} B:{b:2d}) "
+			f"[W:{wins} D:{draws} L:{losses}]")
+
+	print(f"\n{'='*50}")
+	print(f"AI vs {opponent_type}: {wins}W {draws}D {losses}L / {num_games} games")
+	print(f"Win rate: {wins/num_games*100:.1f}%  "
+		f"Draw rate: {draws/num_games*100:.1f}%  "
+		f"Loss rate: {losses/num_games*100:.1f}%")
+
+
+# --- Pygame Human Play ---
+
+def play_human_pygame(config, human_color=2):
+	"""Play against AI using pygame-ce GUI."""
+	try:
+		import pygame
+	except ImportError:
+		print("Error: pygame-ce required. Install: pip install pygame-ce")
+		return
+
+	CELL = 70
+	BOARD_PX = CELL * 8
+	PANEL_W = 220
+	WIN_W = BOARD_PX + PANEL_W
+	WIN_H = BOARD_PX
+
+	GREEN = (0, 120, 0)
+	BLACK = (0, 0, 0)
+	WHITE = (255, 255, 255)
+	PANEL_BG = (32, 32, 32)
+	GRAY = (180, 180, 180)
+	GOLD = (255, 215, 0)
+	RED = (220, 50, 50)
+
+	pygame.init()
+	screen = pygame.display.set_mode((WIN_W, WIN_H))
+	pygame.display.set_caption("DeepReversi")
+	font_lg = pygame.font.SysFont(None, 36)
+	font_md = pygame.font.SysFont(None, 28)
+	font_sm = pygame.font.SysFont(None, 22)
+	clock = pygame.time.Clock()
+
+	net = ReversiNet(config).to(DEVICE)
+	if os.path.exists(config.model_path):
+		net.load_state_dict(
+			torch.load(config.model_path, map_location=DEVICE, weights_only=True)
+		)
+		print(f"Model loaded: {config.model_path}")
+	else:
+		print("Warning: no model found, using random weights")
+	net.eval()
+	mcts = MCTS(net, config)
+
+	ai_color = 3 - human_color
+	board = ReversiBoard()
+	game_over = False
+	last_move = -1
+
+	def draw(status=""):
+		screen.fill(GREEN, (0, 0, BOARD_PX, BOARD_PX))
+		for i in range(9):
+			pygame.draw.line(screen, BLACK,
+				(i * CELL, 0), (i * CELL, BOARD_PX), 2)
+			pygame.draw.line(screen, BLACK,
+				(0, i * CELL), (BOARD_PX, i * CELL), 2)
+
+		for r in range(8):
+			for c in range(8):
+				pos = r * 8 + c
+				cx = c * CELL + CELL // 2
+				cy = r * CELL + CELL // 2
+				if board.white & (1 << pos):
+					pygame.draw.circle(screen, WHITE, (cx, cy), CELL // 2 - 5)
+					pygame.draw.circle(screen, BLACK, (cx, cy), CELL // 2 - 5, 2)
+					if pos == last_move:
+						pygame.draw.circle(screen, RED, (cx, cy), 6)
+				elif board.black & (1 << pos):
+					pygame.draw.circle(screen, (20, 20, 20),
+						(cx, cy), CELL // 2 - 5)
+					pygame.draw.circle(screen, (80, 80, 80),
+						(cx, cy), CELL // 2 - 5, 2)
+					if pos == last_move:
+						pygame.draw.circle(screen, RED, (cx, cy), 6)
+				elif (not game_over and board.turn == human_color
+						and pos in board.valid_moves):
+					s = pygame.Surface((CELL, CELL), pygame.SRCALPHA)
+					pygame.draw.circle(s, (255, 255, 255, 50),
+						(CELL // 2, CELL // 2), 12)
+					screen.blit(s, (c * CELL, r * CELL))
+
+		# Side panel
+		screen.fill(PANEL_BG, (BOARD_PX, 0, PANEL_W, WIN_H))
+		x0 = BOARD_PX + 15
+		y = 20
+		screen.blit(font_lg.render("DeepReversi", True, GOLD), (x0, y))
+		y += 50
+
+		w_count, b_count = board.get_score()
+
+		pygame.draw.circle(screen, WHITE, (x0 + 14, y + 14), 14)
+		pygame.draw.circle(screen, BLACK, (x0 + 14, y + 14), 14, 2)
+		label = "You" if human_color == 1 else "AI"
+		screen.blit(font_md.render(f"  {label}: {w_count}", True, GRAY),
+			(x0 + 32, y + 2))
+		y += 42
+
+		pygame.draw.circle(screen, (20, 20, 20), (x0 + 14, y + 14), 14)
+		label = "You" if human_color == 2 else "AI"
+		screen.blit(font_md.render(f"  {label}: {b_count}", True, GRAY),
+			(x0 + 32, y + 2))
+		y += 60
+
+		if game_over:
+			if w_count == b_count:
+				result = "Draw!"
+			elif ((w_count > b_count) == (human_color == 1)):
+				result = "You Win!"
+			else:
+				result = "AI Wins!"
+			screen.blit(font_lg.render(result, True, GOLD), (x0, y))
+			y += 36
+			screen.blit(font_sm.render(
+				f"Score: {w_count} - {b_count}", True, GRAY), (x0, y))
+			y += 28
+			screen.blit(font_sm.render(
+				"Click: new game", True, GRAY), (x0, y))
+			y += 22
+			screen.blit(font_sm.render("ESC: quit", True, GRAY), (x0, y))
+		elif status:
+			screen.blit(font_md.render(
+				status, True, (255, 200, 100)), (x0, y))
+		else:
+			if board.turn == human_color:
+				screen.blit(font_md.render(
+					"Your turn", True, (100, 255, 100)), (x0, y))
+			else:
+				screen.blit(font_md.render(
+					"AI thinking...", True, (255, 200, 100)), (x0, y))
+		pygame.display.flip()
+
+	running = True
+	while running:
+		if (not game_over and board.turn == ai_color
+				and board.get_valid_moves()):
+			draw("AI thinking...")
+			policy = mcts.search(board, board.turn)
+			move = int(np.argmax(policy))
+			if not board.place(move):
+				game_over = True
+			last_move = move
+			draw()
+
+		for event in pygame.event.get():
+			if event.type == pygame.QUIT:
+				running = False
+			elif event.type == pygame.KEYDOWN:
+				if event.key == pygame.K_ESCAPE:
+					running = False
+				elif event.key == pygame.K_n:
+					board = ReversiBoard()
+					game_over = False
+					last_move = -1
+			elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+				mx, my = event.pos
+				if game_over:
+					board = ReversiBoard()
+					game_over = False
+					last_move = -1
+				elif mx < BOARD_PX and board.turn == human_color:
+					col = mx // CELL
+					row = my // CELL
+					if 0 <= row < 8 and 0 <= col < 8:
+						pos = row * 8 + col
+						if pos in board.get_valid_moves():
+							if not board.place(pos):
+								game_over = True
+							last_move = pos
+		draw()
+		clock.tick(30)
+
+	pygame.quit()
+
+
 # --- Entry Point ---
 
 def main():
-	parser = argparse.ArgumentParser(description="AlphaZero-style Reversi RL Agent")
-	parser.add_argument("mode", choices=["train", "play"],
-		help="train: self-play training, play: connect to GameCenter")
+	parser = argparse.ArgumentParser(
+		description="AlphaZero-style Reversi RL Agent")
+	parser.add_argument("mode",
+		choices=["train", "play", "play-human",
+			"test-gt", "test-random", "test-scoreboard"],
+		help="train | play | play-human | test-gt | "
+			"test-random | test-scoreboard")
 	parser.add_argument("--model", default="reversi_model.pt",
 		help="Model file path (default: reversi_model.pt)")
 	parser.add_argument("--host", default="127.0.0.1",
@@ -789,7 +1142,11 @@ def main():
 	parser.add_argument("--episodes", type=int, default=50,
 		help="Self-play games per iteration (default: 50)")
 	parser.add_argument("--games", type=int, default=0,
-		help="Number of games to play (0=infinite, default: 0)")
+		help="Number of games (0=infinite for play, 100 for test)")
+	parser.add_argument("--gt-depth", type=int, default=5,
+		help="Game tree search depth (default: 5)")
+	parser.add_argument("--color", type=int, default=2, choices=[1, 2],
+		help="Human color: 1=white(first), 2=black (default: 2)")
 	args = parser.parse_args()
 
 	config = Config(
@@ -805,6 +1162,17 @@ def main():
 		Trainer(config).train()
 	elif args.mode == "play":
 		GameCenterClient(config).run(args.games)
+	elif args.mode == "play-human":
+		play_human_pygame(config, args.color)
+	elif args.mode == "test-gt":
+		n = args.games if args.games > 0 else 100
+		test_games(config, "gt", n, args.gt_depth)
+	elif args.mode == "test-random":
+		n = args.games if args.games > 0 else 100
+		test_games(config, "random", n)
+	elif args.mode == "test-scoreboard":
+		n = args.games if args.games > 0 else 100
+		test_games(config, "scoreboard", n)
 
 
 if __name__ == "__main__":
