@@ -146,12 +146,16 @@
     <ClInclude Include="framework.h" />
     <ClInclude Include="GameCenter.h" />
     <ClInclude Include="limittbl.h" />
+    <ClInclude Include="Network.h" />
+    <ClInclude Include="Draw.h" />
     <ClInclude Include="Resource.h" />
     <ClInclude Include="Reversi.h" />
     <ClInclude Include="targetver.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="GameCenter.cpp" />
+    <ClCompile Include="Network.cpp" />
+    <ClCompile Include="Draw.cpp" />
     <ClCompile Include="Reversi.cpp" />
   </ItemGroup>
   <ItemGroup>

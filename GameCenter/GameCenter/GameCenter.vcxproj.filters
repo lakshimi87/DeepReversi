@@ -33,12 +33,24 @@
     <ClInclude Include="limittbl.h">
       <Filter>Source Files</Filter>
     </ClInclude>
+    <ClInclude Include="Network.h">
+      <Filter>Source Files</Filter>
+    </ClInclude>
+    <ClInclude Include="Draw.h">
+      <Filter>Source Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="GameCenter.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="Reversi.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Network.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Draw.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
