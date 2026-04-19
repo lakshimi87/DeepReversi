@@ -44,8 +44,8 @@ def main():
 		help="Number of games (0=infinite for play, 100 for test)")
 	parser.add_argument("--gt-depth", type=int, default=5,
 		help="Game tree search depth (default: 5)")
-	parser.add_argument("--color", type=int, default=2, choices=[1, 2],
-		help="Human color: 1=white(first), 2=black (default: 2)")
+	parser.add_argument("--color", type=int, default=0, choices=[0, 1, 2],
+		help="Human color: 0=random (default), 1=white(first), 2=black")
 	args = parser.parse_args()
 
 	config = Config(

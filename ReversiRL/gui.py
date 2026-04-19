@@ -1,6 +1,7 @@
 """Pygame human-vs-AI GUI."""
 
 import os
+import random
 
 import numpy as np
 
@@ -34,8 +35,11 @@ def _load_board_background(pygame, size):
 	return pygame.transform.smoothscale(img, (size, size))
 
 
-def play_human_pygame(config, human_color=2):
-	"""Play against AI using pygame-ce GUI."""
+def play_human_pygame(config, color_mode=0):
+	"""Play against AI using pygame-ce GUI.
+
+	color_mode: 0=random (re-picked each new game), 1=white, 2=black.
+	"""
 	try:
 		import pygame
 	except ImportError:
@@ -75,10 +79,24 @@ def play_human_pygame(config, human_color=2):
 	net.eval()
 	mcts = MCTS(net, config)
 
+	def pick_human_color():
+		if color_mode in (1, 2):
+			return color_mode
+		return random.choice([1, 2])
+
+	human_color = pick_human_color()
 	ai_color = 3 - human_color
 	board = ReversiBoard()
 	game_over = False
 	last_move = -1
+
+	def new_game():
+		nonlocal board, game_over, last_move, human_color, ai_color
+		human_color = pick_human_color()
+		ai_color = 3 - human_color
+		board = ReversiBoard()
+		game_over = False
+		last_move = -1
 
 	def draw(status=""):
 		# Board background from board.png (or solid fallback)
@@ -184,15 +202,11 @@ def play_human_pygame(config, human_color=2):
 				if event.key == pygame.K_ESCAPE:
 					running = False
 				elif event.key == pygame.K_n:
-					board = ReversiBoard()
-					game_over = False
-					last_move = -1
+					new_game()
 			elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
 				mx, my = event.pos
 				if game_over:
-					board = ReversiBoard()
-					game_over = False
-					last_move = -1
+					new_game()
 				elif mx < BOARD_PX and board.turn == human_color:
 					col = mx // CELL
 					row = my // CELL
